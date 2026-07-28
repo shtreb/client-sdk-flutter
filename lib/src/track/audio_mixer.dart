@@ -19,20 +19,19 @@ import '../support/native.dart';
 import '../support/platform.dart';
 import 'local/audio.dart';
 
-/// iOS-only helper that mixes audio files into the published LiveKit microphone
-/// stream (and local render path).
+/// iOS-only helper that mixes audio files into the LiveKit WebRTC audio graph.
 ///
 /// Use this instead of a separate audio player while in a LiveKit call: session
-/// modes like `voiceChat` / `videoChat` duck third-party playback, so remote
-/// (and local) listeners hear those sounds quieter. Mixing into the WebRTC
-/// graph keeps levels consistent.
+/// modes like `voiceChat` / `videoChat` duck third-party playback.
 ///
-/// Example:
+/// Example (local only — other participants do not hear it):
 /// ```dart
 /// final mixer = await MixAudio.start(localAudioTrack);
-/// final playId = await mixer?.play('/path/to/sound.wav');
-/// await mixer?.stop(playId);
-/// await mixer?.dispose();
+/// await mixer?.play(
+///   '/path/to/sound.wav',
+///   playLocally: true,
+///   sendToRemote: false,
+/// );
 /// ```
 class MixAudio {
   MixAudio._(this._trackId);
@@ -70,6 +69,9 @@ class MixAudio {
 
   /// Plays an audio file from a local filesystem [filePath].
   ///
+  /// - [playLocally]: mix into the render (speaker) path.
+  /// - [sendToRemote]: mix into the capture (mic publish) path.
+  ///
   /// Returns a [playId] that can be passed to [stop] / [setVolume], or `null`
   /// on failure.
   ///
@@ -78,10 +80,16 @@ class MixAudio {
     String filePath, {
     double volume = 1.0,
     bool loop = false,
+    bool playLocally = true,
+    bool sendToRemote = true,
     String? playId,
   }) async {
     if (_disposed) {
       logger.warning('MixAudio.play called after dispose');
+      return null;
+    }
+    if (!playLocally && !sendToRemote) {
+      logger.warning('MixAudio.play: playLocally and sendToRemote are both false');
       return null;
     }
     final id = playId ?? _uuid.v4();
@@ -90,6 +98,8 @@ class MixAudio {
       playId: id,
       volume: volume,
       loop: loop,
+      playLocally: playLocally,
+      sendToRemote: sendToRemote,
     );
   }
 

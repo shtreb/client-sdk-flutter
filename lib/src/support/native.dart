@@ -166,6 +166,8 @@ class Native {
     required String playId,
     double volume = 1.0,
     bool loop = false,
+    bool playLocally = true,
+    bool sendToRemote = true,
   }) async {
     try {
       final result = await channel.invokeMethod<String>(
@@ -175,6 +177,8 @@ class Native {
           'playId': playId,
           'volume': volume,
           'loop': loop,
+          'playLocally': playLocally,
+          'sendToRemote': sendToRemote,
         },
       );
       return result;

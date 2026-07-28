@@ -34,8 +34,7 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
 
     #if os(iOS)
     var cancellable = Set<AnyCancellable>()
-    var audioMixer: AudioMixerProcessor?
-    var audioMixerTrackId: String?
+    var audioMixer: AudioMixerController?
     #endif
 
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -187,20 +186,13 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
             return
         }
 
-        // Re-attach if already running on another track.
         if let existing = audioMixer, existing.isAttached {
             handleStopAudioMixerInternal()
         }
 
-        let mixer = audioMixer ?? AudioMixerProcessor()
-        localTrack.addProcessing(mixer)
-        // Also mix into the render path so the local user hears the sound
-        // at full level (not ducked by voiceChat / videoChat session mode).
-        AudioManager.sharedInstance().renderPreProcessingAdapter.addProcessing(mixer)
-
-        mixer.isAttached = true
+        let mixer = audioMixer ?? AudioMixerController()
+        mixer.attach(to: localTrack, trackId: trackId)
         audioMixer = mixer
-        audioMixerTrackId = trackId
         result(true)
     }
 
@@ -217,8 +209,17 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
         let playId = (args["playId"] as? String) ?? UUID().uuidString
         let volume = Self.floatArg(args["volume"], default: 1.0)
         let loop = (args["loop"] as? Bool) ?? false
+        let playLocally = (args["playLocally"] as? Bool) ?? true
+        let sendToRemote = (args["sendToRemote"] as? Bool) ?? true
 
-        let ok = mixer.play(filePath: filePath, playId: playId, volume: volume, loop: loop)
+        let ok = mixer.engine.play(
+            filePath: filePath,
+            playId: playId,
+            volume: volume,
+            loop: loop,
+            playLocally: playLocally,
+            sendToRemote: sendToRemote
+        )
         if ok {
             result(playId)
         } else {
@@ -232,7 +233,7 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
             return
         }
         let playId = args["playId"] as? String
-        mixer.stop(playId: playId)
+        mixer.engine.stop(playId: playId)
         result(true)
     }
 
@@ -246,7 +247,7 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
             return
         }
         let volume = Self.floatArg(args["volume"], default: 1.0)
-        mixer.setVolume(playId: playId, volume: volume)
+        mixer.engine.setVolume(playId: playId, volume: volume)
         result(true)
     }
 
@@ -258,15 +259,11 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
     private func handleStopAudioMixerInternal() {
         guard let mixer = audioMixer else { return }
 
-        if let trackId = audioMixerTrackId,
-           let localTrack = FlutterWebRTCPlugin.sharedSingleton()?.localTracks![trackId] as? LocalAudioTrack {
-            localTrack.removeProcessing(mixer)
+        var localTrack: LocalAudioTrack?
+        if let trackId = mixer.trackId {
+            localTrack = FlutterWebRTCPlugin.sharedSingleton()?.localTracks![trackId] as? LocalAudioTrack
         }
-        AudioManager.sharedInstance().renderPreProcessingAdapter.removeProcessing(mixer)
-
-        mixer.stop(playId: nil)
-        mixer.isAttached = false
-        audioMixerTrackId = nil
+        mixer.detach(from: localTrack)
     }
 
     private static func floatArg(_ value: Any?, default defaultValue: Float) -> Float {

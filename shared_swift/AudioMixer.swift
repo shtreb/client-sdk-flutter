@@ -21,116 +21,53 @@ import WebRTC
 import flutter_webrtc
 import os.lock
 
-/// Mixes local audio files into the LiveKit / WebRTC capture (and render) graph
-/// so sounds are heard at full level instead of being ducked by AVAudioSession voice modes.
+/// Shared playback state for capture/render taps.
 ///
-/// Playback position is driven by `CACurrentMediaTime` so the same processor instance can be
-/// attached to both capture and render adapters without advancing twice as fast.
-final class AudioMixerProcessor: NSObject, ExternalAudioProcessingDelegate {
-
-    private struct Playback {
+/// Samples are kept in the file's native sample rate as FloatS16
+/// (`[-32768, 32767]`). Mixing resamples with linear interpolation to the
+/// buffer rate so pitch/speed stay correct even when capture and render rates
+/// differ from the file (or from each other).
+final class AudioMixerEngine {
+    struct Playback {
         let id: String
-        let samples: [Int16]
+        /// FloatS16 mono samples at `sampleRate`.
+        let samples: [Float]
+        let sampleRate: Double
         let startMediaTime: CFTimeInterval
         var volume: Float
         let loop: Bool
+        let playLocally: Bool
+        let sendToRemote: Bool
     }
 
     private var lock = os_unfair_lock_s()
     private var playbooks: [Playback] = []
-    private var sampleRate: Double = 48_000
-    private var channelCount: Int = 1
 
-    var isAttached: Bool = false
-
-    // MARK: - ExternalAudioProcessingDelegate
-
-    func audioProcessingInitialize(withSampleRate sampleRateHz: Int, channels: Int) {
-        os_unfair_lock_lock(&lock)
-        sampleRate = Double(sampleRateHz)
-        channelCount = max(1, channels)
-        os_unfair_lock_unlock(&lock)
+    enum TapKind {
+        case capture
+        case render
     }
-
-    func audioProcessingProcess(_ audioBuffer: RTCAudioBuffer) {
-        let frames = Int(audioBuffer.frames)
-        let channels = Int(audioBuffer.channels)
-        guard frames > 0, channels > 0 else { return }
-
-        let inferredRate = Double(frames * 100)
-        let now = CACurrentMediaTime()
-
-        os_unfair_lock_lock(&lock)
-        if abs(inferredRate - sampleRate) > 1 || channels != channelCount {
-            sampleRate = inferredRate
-            channelCount = channels
-        }
-
-        let rate = sampleRate
-        var finishedIds: [String] = []
-
-        for playback in playbooks {
-            guard !playback.samples.isEmpty else {
-                finishedIds.append(playback.id)
-                continue
-            }
-
-            let elapsedFrames = Int((now - playback.startMediaTime) * rate)
-            if elapsedFrames < 0 { continue }
-
-            var sourceFrame = elapsedFrames
-            if playback.loop {
-                sourceFrame = sourceFrame % playback.samples.count
-            } else if sourceFrame >= playback.samples.count {
-                finishedIds.append(playback.id)
-                continue
-            }
-
-            for frame in 0 ..< frames {
-                var idx = sourceFrame + frame
-                if playback.loop {
-                    idx = idx % playback.samples.count
-                } else if idx >= playback.samples.count {
-                    break
-                }
-
-                let sample = Float(playback.samples[idx]) * playback.volume
-                for ch in 0 ..< channels {
-                    let buffer = audioBuffer.rawBuffer(forChannel: ch)
-                    let mixed = buffer[frame] + sample
-                    buffer[frame] = max(Float(Int16.min), min(Float(Int16.max), mixed))
-                }
-            }
-        }
-
-        if !finishedIds.isEmpty {
-            let unique = Set(finishedIds)
-            playbooks.removeAll { unique.contains($0.id) }
-        }
-        os_unfair_lock_unlock(&lock)
-    }
-
-    func audioProcessingRelease() {
-        os_unfair_lock_lock(&lock)
-        playbooks.removeAll()
-        os_unfair_lock_unlock(&lock)
-    }
-
-    // MARK: - Control
 
     @discardableResult
-    func play(filePath: String, playId: String, volume: Float, loop: Bool) -> Bool {
+    func play(
+        filePath: String,
+        playId: String,
+        volume: Float,
+        loop: Bool,
+        playLocally: Bool,
+        sendToRemote: Bool
+    ) -> Bool {
+        guard playLocally || sendToRemote else {
+            print("[LiveKit] AudioMixer: playLocally and sendToRemote are both false")
+            return false
+        }
         guard FileManager.default.fileExists(atPath: filePath) else {
             print("[LiveKit] AudioMixer: file not found: \(filePath)")
             return false
         }
 
-        os_unfair_lock_lock(&lock)
-        let rate = sampleRate
-        os_unfair_lock_unlock(&lock)
-
         let url = URL(fileURLWithPath: filePath)
-        guard let samples = Self.loadMonoInt16(url: url, sampleRate: rate) else {
+        guard let decoded = Self.loadMonoFloatS16(url: url) else {
             print("[LiveKit] AudioMixer: failed to decode: \(filePath)")
             return false
         }
@@ -139,10 +76,13 @@ final class AudioMixerProcessor: NSObject, ExternalAudioProcessingDelegate {
         playbooks.removeAll { $0.id == playId }
         playbooks.append(Playback(
             id: playId,
-            samples: samples,
+            samples: decoded.samples,
+            sampleRate: decoded.sampleRate,
             startMediaTime: CACurrentMediaTime(),
             volume: max(0, volume),
-            loop: loop
+            loop: loop,
+            playLocally: playLocally,
+            sendToRemote: sendToRemote
         ))
         os_unfair_lock_unlock(&lock)
         return true
@@ -166,71 +106,186 @@ final class AudioMixerProcessor: NSObject, ExternalAudioProcessingDelegate {
         os_unfair_lock_unlock(&lock)
     }
 
-    // MARK: - Decoding
+    func mix(into audioBuffer: RTCAudioBuffer, kind: TapKind) {
+        let frames = Int(audioBuffer.frames)
+        let channels = Int(audioBuffer.channels)
+        guard frames > 0, channels > 0 else { return }
 
-    private static func loadMonoInt16(url: URL, sampleRate: Double) -> [Int16]? {
+        // ~10 ms WebRTC buffers.
+        let bufferRate = Double(frames * 100)
+        let now = CACurrentMediaTime()
+
+        os_unfair_lock_lock(&lock)
+        var finishedIds: [String] = []
+
+        for playback in playbooks {
+            switch kind {
+            case .capture where !playback.sendToRemote: continue
+            case .render where !playback.playLocally: continue
+            default: break
+            }
+
+            guard !playback.samples.isEmpty, playback.sampleRate > 0 else {
+                finishedIds.append(playback.id)
+                continue
+            }
+
+            let elapsedSec = now - playback.startMediaTime
+            if elapsedSec < 0 { continue }
+
+            let srcStart = elapsedSec * playback.sampleRate
+            let durationSec = Double(playback.samples.count) / playback.sampleRate
+
+            if !playback.loop, elapsedSec >= durationSec {
+                finishedIds.append(playback.id)
+                continue
+            }
+
+            for ch in 0 ..< channels {
+                let buffer = audioBuffer.rawBuffer(forChannel: ch)
+                for frame in 0 ..< frames {
+                    var srcPos = srcStart + Double(frame) * (playback.sampleRate / bufferRate)
+                    if playback.loop {
+                        let count = Double(playback.samples.count)
+                        srcPos = srcPos.truncatingRemainder(dividingBy: count)
+                        if srcPos < 0 { srcPos += count }
+                    } else if srcPos >= Double(playback.samples.count - 1) {
+                        break
+                    }
+
+                    let sample = Self.interpolate(playback.samples, at: srcPos) * playback.volume
+                    // Soft clip to reduce harsh distortion vs hard Int16 clamp.
+                    buffer[frame] = Self.softClip(buffer[frame] + sample)
+                }
+            }
+        }
+
+        if !finishedIds.isEmpty {
+            let unique = Set(finishedIds)
+            playbooks.removeAll { unique.contains($0.id) }
+        }
+        os_unfair_lock_unlock(&lock)
+    }
+
+    // MARK: - Helpers
+
+    private static func interpolate(_ samples: [Float], at position: Double) -> Float {
+        if samples.isEmpty { return 0 }
+        if position <= 0 { return samples[0] }
+        let maxIndex = samples.count - 1
+        if position >= Double(maxIndex) { return samples[maxIndex] }
+
+        let i0 = Int(position)
+        let i1 = min(i0 + 1, maxIndex)
+        let frac = Float(position - Double(i0))
+        return samples[i0] + (samples[i1] - samples[i0]) * frac
+    }
+
+    /// Soft clip toward ±32767 (FloatS16 range used by WebRTC AudioBuffer).
+    private static func softClip(_ value: Float) -> Float {
+        let limit: Float = 32767
+        let x = value / limit
+        // tanh-ish soft clip, then scale back
+        let y = x / (1 + abs(x))
+        return y * limit
+    }
+
+    /// Decode file at its native rate to mono FloatS16 (no upfront resample).
+    private static func loadMonoFloatS16(url: URL) -> (samples: [Float], sampleRate: Double)? {
         do {
             let file = try AVAudioFile(forReading: url)
-            let inputFormat = file.processingFormat
+            let format = file.processingFormat
             let frameCount = AVAudioFrameCount(file.length)
             guard frameCount > 0,
-                  let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: frameCount)
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)
             else { return nil }
 
-            try file.read(into: inputBuffer)
+            try file.read(into: buffer)
+            let length = Int(buffer.frameLength)
+            guard length > 0 else { return nil }
 
-            guard let outputFormat = AVAudioFormat(
-                commonFormat: .pcmFormatInt16,
-                sampleRate: sampleRate,
-                channels: 1,
-                interleaved: true
-            ) else { return nil }
+            var mono = [Float](repeating: 0, count: length)
+            let channelCount = Int(format.channelCount)
 
-            if inputFormat.sampleRate == sampleRate,
-               inputFormat.commonFormat == .pcmFormatInt16,
-               inputFormat.channelCount == 1,
-               let data = inputBuffer.int16ChannelData
-            {
-                let length = Int(inputBuffer.frameLength)
-                return Array(UnsafeBufferPointer(start: data[0], count: length))
-            }
-
-            guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-                return nil
-            }
-
-            let ratio = sampleRate / inputFormat.sampleRate
-            let capacity = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio) + 64
-            guard let outputBuffer = AVAudioPCMBuffer(
-                pcmFormat: outputFormat,
-                frameCapacity: capacity
-            ) else { return nil }
-
-            var inputConsumed = false
-            var error: NSError?
-            let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-                if inputConsumed {
-                    outStatus.pointee = .endOfStream
-                    return nil
+            if let floatData = buffer.floatChannelData {
+                for frame in 0 ..< length {
+                    var sum: Float = 0
+                    for ch in 0 ..< channelCount {
+                        sum += floatData[ch][frame]
+                    }
+                    // processingFormat float is typically [-1, 1] → FloatS16
+                    mono[frame] = (sum / Float(channelCount)) * 32767.0
                 }
-                inputConsumed = true
-                outStatus.pointee = .haveData
-                return inputBuffer
-            }
-
-            converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
-            if let error {
-                print("[LiveKit] AudioMixer convert error: \(error)")
+            } else if let int16Data = buffer.int16ChannelData {
+                for frame in 0 ..< length {
+                    var sum: Float = 0
+                    for ch in 0 ..< channelCount {
+                        sum += Float(int16Data[ch][frame])
+                    }
+                    mono[frame] = sum / Float(channelCount)
+                }
+            } else {
                 return nil
             }
 
-            guard let channelData = outputBuffer.int16ChannelData else { return nil }
-            let length = Int(outputBuffer.frameLength)
-            return Array(UnsafeBufferPointer(start: channelData[0], count: length))
+            return (mono, format.sampleRate)
         } catch {
             print("[LiveKit] AudioMixer decode error: \(error)")
             return nil
         }
+    }
+}
+
+/// Thin tap so capture and render can filter playbooks independently.
+final class AudioMixerTap: NSObject, ExternalAudioProcessingDelegate {
+    private let engine: AudioMixerEngine
+    private let kind: AudioMixerEngine.TapKind
+
+    init(engine: AudioMixerEngine, kind: AudioMixerEngine.TapKind) {
+        self.engine = engine
+        self.kind = kind
+        super.init()
+    }
+
+    func audioProcessingInitialize(withSampleRate sampleRateHz: Int, channels: Int) {
+        // Rate is taken from each buffer in process(); nothing to store.
+    }
+
+    func audioProcessingProcess(_ audioBuffer: RTCAudioBuffer) {
+        engine.mix(into: audioBuffer, kind: kind)
+    }
+
+    func audioProcessingRelease() {}
+}
+
+/// Owns engine + taps attached to WebRTC capture/render adapters.
+final class AudioMixerController {
+    let engine = AudioMixerEngine()
+    let captureTap: AudioMixerTap
+    let renderTap: AudioMixerTap
+    var isAttached = false
+    var trackId: String?
+
+    init() {
+        captureTap = AudioMixerTap(engine: engine, kind: .capture)
+        renderTap = AudioMixerTap(engine: engine, kind: .render)
+    }
+
+    func attach(to localTrack: LocalAudioTrack, trackId: String) {
+        localTrack.addProcessing(captureTap)
+        AudioManager.sharedInstance().renderPreProcessingAdapter.addProcessing(renderTap)
+        self.trackId = trackId
+        isAttached = true
+    }
+
+    func detach(from localTrack: LocalAudioTrack?) {
+        if let localTrack {
+            localTrack.removeProcessing(captureTap)
+        }
+        AudioManager.sharedInstance().renderPreProcessingAdapter.removeProcessing(renderTap)
+        engine.stop(playId: nil)
+        trackId = nil
+        isAttached = false
     }
 }
 
