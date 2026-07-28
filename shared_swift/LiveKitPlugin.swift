@@ -34,6 +34,8 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
 
     #if os(iOS)
     var cancellable = Set<AnyCancellable>()
+    var audioMixer: AudioMixerProcessor?
+    var audioMixerTrackId: String?
     #endif
 
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -172,6 +174,115 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
         result(true)
     }
 
+    #if os(iOS)
+    public func handleStartAudioMixer(args: [String: Any?], result: @escaping FlutterResult) {
+        let webrtc = FlutterWebRTCPlugin.sharedSingleton()
+        guard let trackId = args["trackId"] as? String else {
+            result(FlutterError(code: "trackId", message: "trackId is required", details: nil))
+            return
+        }
+
+        guard let localTrack = webrtc?.localTracks![trackId] as? LocalAudioTrack else {
+            result(FlutterError(code: "track", message: "LocalAudioTrack not found for trackId", details: nil))
+            return
+        }
+
+        // Re-attach if already running on another track.
+        if let existing = audioMixer, existing.isAttached {
+            handleStopAudioMixerInternal()
+        }
+
+        let mixer = audioMixer ?? AudioMixerProcessor()
+        localTrack.addProcessing(mixer)
+        // Also mix into the render path so the local user hears the sound
+        // at full level (not ducked by voiceChat / videoChat session mode).
+        AudioManager.sharedInstance().renderPreProcessingAdapter.addProcessing(mixer)
+
+        mixer.isAttached = true
+        audioMixer = mixer
+        audioMixerTrackId = trackId
+        result(true)
+    }
+
+    public func handlePlayMixedAudio(args: [String: Any?], result: @escaping FlutterResult) {
+        guard let mixer = audioMixer, mixer.isAttached else {
+            result(FlutterError(code: "mixer", message: "Audio mixer is not started. Call startAudioMixer first.", details: nil))
+            return
+        }
+        guard let filePath = args["filePath"] as? String else {
+            result(FlutterError(code: "filePath", message: "filePath is required", details: nil))
+            return
+        }
+
+        let playId = (args["playId"] as? String) ?? UUID().uuidString
+        let volume = Self.floatArg(args["volume"], default: 1.0)
+        let loop = (args["loop"] as? Bool) ?? false
+
+        let ok = mixer.play(filePath: filePath, playId: playId, volume: volume, loop: loop)
+        if ok {
+            result(playId)
+        } else {
+            result(FlutterError(code: "play", message: "Failed to play audio file", details: nil))
+        }
+    }
+
+    public func handleStopMixedAudio(args: [String: Any?], result: @escaping FlutterResult) {
+        guard let mixer = audioMixer else {
+            result(true)
+            return
+        }
+        let playId = args["playId"] as? String
+        mixer.stop(playId: playId)
+        result(true)
+    }
+
+    public func handleSetMixedAudioVolume(args: [String: Any?], result: @escaping FlutterResult) {
+        guard let mixer = audioMixer else {
+            result(FlutterError(code: "mixer", message: "Audio mixer is not started", details: nil))
+            return
+        }
+        guard let playId = args["playId"] as? String else {
+            result(FlutterError(code: "playId", message: "playId is required", details: nil))
+            return
+        }
+        let volume = Self.floatArg(args["volume"], default: 1.0)
+        mixer.setVolume(playId: playId, volume: volume)
+        result(true)
+    }
+
+    public func handleStopAudioMixer(args: [String: Any?], result: @escaping FlutterResult) {
+        handleStopAudioMixerInternal()
+        result(true)
+    }
+
+    private func handleStopAudioMixerInternal() {
+        guard let mixer = audioMixer else { return }
+
+        if let trackId = audioMixerTrackId,
+           let localTrack = FlutterWebRTCPlugin.sharedSingleton()?.localTracks![trackId] as? LocalAudioTrack {
+            localTrack.removeProcessing(mixer)
+        }
+        AudioManager.sharedInstance().renderPreProcessingAdapter.removeProcessing(mixer)
+
+        mixer.stop(playId: nil)
+        mixer.isAttached = false
+        audioMixerTrackId = nil
+    }
+
+    private static func floatArg(_ value: Any?, default defaultValue: Float) -> Float {
+        if let number = value as? NSNumber {
+            return number.floatValue
+        }
+        if let double = value as? Double {
+            return Float(double)
+        }
+        if let int = value as? Int {
+            return Float(int)
+        }
+        return defaultValue
+    }
+    #endif
+
     public func handleConfigureNativeAudio(args: [String: Any?], result: @escaping FlutterResult) {
 
         #if os(macOS)
@@ -284,6 +395,16 @@ public class LiveKitPlugin: NSObject, FlutterPlugin {
         case "broadcastRequestStop":
             BroadcastManager.shared.requestStop()
             result(true)
+        case "startAudioMixer":
+            handleStartAudioMixer(args: args, result: result)
+        case "playMixedAudio":
+            handlePlayMixedAudio(args: args, result: result)
+        case "stopMixedAudio":
+            handleStopMixedAudio(args: args, result: result)
+        case "setMixedAudioVolume":
+            handleSetMixedAudioVolume(args: args, result: result)
+        case "stopAudioMixer":
+            handleStopAudioMixer(args: args, result: result)
         #endif
         default:
             print("[LiveKit] method not found: ", call.method)

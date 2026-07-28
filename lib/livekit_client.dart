@@ -50,6 +50,7 @@ export 'src/track/processor_native.dart'
     if (dart.library.js_interop) 'src/track/processor_web.dart';
 
 export 'src/track/audio_visualizer.dart';
+export 'src/track/audio_mixer.dart';
 export 'src/types/other.dart';
 export 'src/types/participant_permissions.dart';
 export 'src/types/video_dimensions.dart';

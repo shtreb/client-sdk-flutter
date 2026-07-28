@@ -36,4 +36,12 @@ public extension LKLocalAudioTrack {
     func remove(audioRenderer: RTCAudioRenderer) {
         audioTrack.remove(audioRenderer)
     }
+
+    func add(processing: ExternalAudioProcessingDelegate) {
+        audioTrack.addProcessing(processing)
+    }
+
+    func remove(processing: ExternalAudioProcessingDelegate) {
+        audioTrack.removeProcessing(processing)
+    }
 }

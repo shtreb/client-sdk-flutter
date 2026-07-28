@@ -142,6 +142,89 @@ class Native {
       logger.warning('broadcastRequestStop did throw error: ${error}');
     }
   }
+
+  /// iOS-only: attach mixer to the local audio track capture/render graph.
+  @internal
+  static Future<bool> startAudioMixer(String trackId) async {
+    try {
+      final result = await channel.invokeMethod<bool>(
+        'startAudioMixer',
+        <String, dynamic>{'trackId': trackId},
+      );
+      return result == true;
+    } catch (error) {
+      logger.warning('startAudioMixer did throw $error');
+      return false;
+    }
+  }
+
+  /// iOS-only: play a local audio file mixed into the LiveKit audio graph.
+  /// Returns the playId on success.
+  @internal
+  static Future<String?> playMixedAudio(
+    String filePath, {
+    required String playId,
+    double volume = 1.0,
+    bool loop = false,
+  }) async {
+    try {
+      final result = await channel.invokeMethod<String>(
+        'playMixedAudio',
+        <String, dynamic>{
+          'filePath': filePath,
+          'playId': playId,
+          'volume': volume,
+          'loop': loop,
+        },
+      );
+      return result;
+    } catch (error) {
+      logger.warning('playMixedAudio did throw $error');
+      return null;
+    }
+  }
+
+  /// iOS-only: stop one or all mixed playbooks.
+  @internal
+  static Future<void> stopMixedAudio({String? playId}) async {
+    try {
+      await channel.invokeMethod<void>(
+        'stopMixedAudio',
+        <String, dynamic>{'playId': playId},
+      );
+    } catch (error) {
+      logger.warning('stopMixedAudio did throw $error');
+    }
+  }
+
+  /// iOS-only: update volume of an active mixed playback.
+  @internal
+  static Future<void> setMixedAudioVolume(String playId, double volume) async {
+    try {
+      await channel.invokeMethod<void>(
+        'setMixedAudioVolume',
+        <String, dynamic>{
+          'playId': playId,
+          'volume': volume,
+        },
+      );
+    } catch (error) {
+      logger.warning('setMixedAudioVolume did throw $error');
+    }
+  }
+
+  /// iOS-only: detach mixer from the WebRTC audio graph.
+  @internal
+  static Future<void> stopAudioMixer() async {
+    try {
+      await channel.invokeMethod<void>(
+        'stopAudioMixer',
+        <String, dynamic>{},
+      );
+    } catch (error) {
+      logger.warning('stopAudioMixer did throw $error');
+    }
+  }
 }
 
 // Initialize the channel before first reference so method calls can be handled.
