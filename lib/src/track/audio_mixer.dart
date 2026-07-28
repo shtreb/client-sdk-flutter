@@ -109,7 +109,11 @@ class MixAudio {
     await Native.stopMixedAudio(playId: playId);
   }
 
-  /// Updates volume for an active playback (`1.0` = original file level).
+  /// Updates volume for an active playback.
+  ///
+  /// `1.0` is the automatically normalized speech-like level; use this value
+  /// as a relative adjustment when a particular sound should be quieter or
+  /// louder.
   Future<void> setVolume(String playId, double volume) async {
     if (_disposed) return;
     await Native.setMixedAudioVolume(playId, volume);

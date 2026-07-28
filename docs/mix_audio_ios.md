@@ -95,16 +95,36 @@ await mixer?.dispose();
 
 ## Качество звука / анти-искажения
 
-Раньше искажения давал **неверный resample**: файл декодировался сразу в 48 kHz (или default), а позиция считалась по реальному rate буфера (`frames * 100`), из‑за чего pitch/speed ломались.
+Типичные причины «сильного» искажения и что сделано:
 
-Сейчас:
+1. **Неверный sample rate из `frames * 100`**
+   Формула верна только для буферов ровно 10 ms. Если AudioUnit/APM даёт другой размер, pitch/скорость плывут и звук «рвётся».
+   → берём rate из `audioProcessingInitialize`; fallback на `frames*100` только если init не пришёл.
 
-1. Файл декодируется в **native sample rate** → mono **FloatS16** (`[-32768, 32767]`).
-2. В `process` позиция = `elapsedSec * fileSampleRate`.
-3. В каждый output frame — **linear interpolation** под `bufferRate` (`frames * 100`).
-4. Soft-clip вместо жёсткого clamp в Int16 (меньше «хрипа» при пиках).
+2. **Wall-clock позиция (`CACurrentMediaTime`)**
+   Callbacks не идеально равномерны → skip/repeat кусков.
+   → у каждого tap свой **frame cursor** (`captureReadPos` / `renderReadPos`), двигается на `frames * (fileRate/deviceRate)` за callback.
 
-Формат WebRTC `RTCAudioBuffer.rawBuffer`: FloatS16 (не нормализованный `[-1, 1]`).
+3. **Неправильный soft-clip и перегруз при суммировании**
+   Старый soft-clip менял даже тихий сигнал, а hard clamp хрипел на каждом
+   перегруженном пике. Теперь файл автоматически нормализуется по active RMS
+   примерно к `-20 dBFS`, его пики удерживаются ниже `-6 dBFS`, а зона
+   перегруза сжимается плавно. Параметр `volume` работает как относительная
+   поправка поверх автоматической нормализации.
+
+4. **MP3 decode** одним `read` иногда неполный.
+   → chunked read через `AVAudioFile` до EOF.
+
+5. Файл декодируется в **native rate** (для тестового CDN mp3 это 48 kHz stereo → mono FloatS16), ресемпл в device rate через linear interpolation.
+
+6. На первых и последних 5 ms файла применяется короткий fade, чтобы начало,
+   окончание и loop не создавали щелчок из-за разрыва waveform.
+
+Формат WebRTC `RTCAudioBuffer.rawBuffer`: **FloatS16**, не `[-1, 1]`.
+
+В Xcode console при старте/play смотри логи:
+`[LiveKit] AudioMixer: render initialize rate=...`
+`[LiveKit] AudioMixer: loaded N samples @ RATE Hz, peak=...`
 
 ---
 
