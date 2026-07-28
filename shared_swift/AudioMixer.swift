@@ -24,9 +24,10 @@ import os.lock
 /// Shared playback state for capture/render taps.
 ///
 /// Samples are stored as mono FloatS16 at the **file native rate**.
-/// Each tap advances its own read cursor by `frames` using the sample rate from
-/// `audioProcessingInitialize` (NOT `frames * 100`, which breaks when the
-/// audio unit buffer is not exactly 10 ms — a common cause of strong distortion).
+/// Each tap advances its own read cursor by `frames` using the full-band sample
+/// rate. WebRTC may initialize split-band processing with the rate of one band,
+/// so the effective rate is resolved from `frames`, `bands`, and
+/// `framesPerBand` instead of trusting the initialized value unconditionally.
 final class AudioMixerEngine {
     struct Playback {
         let id: String
@@ -116,16 +117,12 @@ final class AudioMixerEngine {
         os_unfair_lock_unlock(&lock)
     }
 
-    /// - Parameter deviceSampleRate: rate from `audioProcessingInitialize` for this tap.
-    func mix(into audioBuffer: RTCAudioBuffer, kind: TapKind, deviceSampleRate: Double) {
+    func mix(into audioBuffer: RTCAudioBuffer, kind: TapKind, outputSampleRate: Double) {
         let frames = Int(audioBuffer.frames)
         let channels = Int(audioBuffer.channels)
         guard frames > 0, channels > 0 else { return }
 
-        // Prefer the initialized device rate. Only fall back to frames*100 if
-        // initialize has not run yet (should be rare).
-        let outRate = deviceSampleRate > 0 ? deviceSampleRate : Double(max(frames, 1) * 100)
-        guard outRate > 0 else { return }
+        guard outputSampleRate > 0 else { return }
 
         os_unfair_lock_lock(&lock)
         var finishedIds: [String] = []
@@ -145,7 +142,7 @@ final class AudioMixerEngine {
             }
 
             // How far to advance in the *source* for one output sample.
-            let srcStep = playback.sampleRate / outRate
+            let srcStep = playback.sampleRate / outputSampleRate
             var readPos: Double
             switch kind {
             case .capture: readPos = playback.captureReadPos
@@ -425,20 +422,64 @@ final class AudioMixerTap: NSObject, ExternalAudioProcessingDelegate {
     }
 
     func audioProcessingProcess(_ audioBuffer: RTCAudioBuffer) {
-        // If this tap was attached after APM init, initialize may never fire.
-        if deviceSampleRate <= 0 {
-            deviceSampleRate = Double(audioBuffer.frames * 100)
-        }
+        let outputSampleRate = Self.fullBandSampleRate(
+            initializedRate: deviceSampleRate,
+            frames: Int(audioBuffer.frames),
+            bands: Int(audioBuffer.bands),
+            framesPerBand: Int(audioBuffer.framesPerBand)
+        )
         if !loggedFormat {
             loggedFormat = true
-            print("[LiveKit] AudioMixer: \(kind) process frames=\(audioBuffer.frames) channels=\(audioBuffer.channels) bands=\(audioBuffer.bands) framesPerBand=\(audioBuffer.framesPerBand) deviceRate=\(deviceSampleRate)")
+            print(
+                "[LiveKit] AudioMixer: \(kind) process frames=\(audioBuffer.frames) " +
+                "channels=\(audioBuffer.channels) bands=\(audioBuffer.bands) " +
+                "framesPerBand=\(audioBuffer.framesPerBand) initializedRate=\(deviceSampleRate) " +
+                "fullBandRate=\(outputSampleRate)"
+            )
         }
-        engine.mix(into: audioBuffer, kind: kind, deviceSampleRate: deviceSampleRate)
+        engine.mix(
+            into: audioBuffer,
+            kind: kind,
+            outputSampleRate: outputSampleRate
+        )
     }
 
     func audioProcessingRelease() {
         deviceSampleRate = 0
         loggedFormat = false
+    }
+
+    /// WebRTC audio processing operates on 10 ms buffers. With split-band
+    /// processing `initializedRate` can describe one band (for example 16 kHz)
+    /// while `rawBuffer` exposes all 480 full-band frames. Resolve that case to
+    /// 48 kHz; otherwise prefer an initialized full-band rate that agrees with
+    /// the callback shape.
+    private static func fullBandSampleRate(
+        initializedRate: Double,
+        frames: Int,
+        bands: Int,
+        framesPerBand: Int
+    ) -> Double {
+        let frameDerivedRate = Double(max(frames, 1) * 100)
+        guard initializedRate > 0 else { return frameDerivedRate }
+
+        let safeBands = max(bands, 1)
+        if safeBands > 1, framesPerBand > 0 {
+            let perBandDerivedRate = Double(framesPerBand * 100)
+            if Self.ratesApproximatelyEqual(initializedRate, perBandDerivedRate) {
+                return initializedRate * Double(safeBands)
+            }
+        }
+
+        if Self.ratesApproximatelyEqual(initializedRate, frameDerivedRate) {
+            return initializedRate
+        }
+        return frameDerivedRate
+    }
+
+    private static func ratesApproximatelyEqual(_ lhs: Double, _ rhs: Double) -> Bool {
+        guard lhs > 0, rhs > 0 else { return false }
+        return abs(lhs - rhs) <= max(lhs, rhs) * 0.05
     }
 }
 

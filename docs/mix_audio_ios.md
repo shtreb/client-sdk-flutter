@@ -97,9 +97,11 @@ await mixer?.dispose();
 
 Типичные причины «сильного» искажения и что сделано:
 
-1. **Неверный sample rate из `frames * 100`**
-   Формула верна только для буферов ровно 10 ms. Если AudioUnit/APM даёт другой размер, pitch/скорость плывут и звук «рвётся».
-   → берём rate из `audioProcessingInitialize`; fallback на `frames*100` только если init не пришёл.
+1. **Sample rate split-band буфера**
+   `audioProcessingInitialize` может сообщить rate одной полосы (например,
+   16 kHz), хотя `rawBuffer` содержит full-band кадры 48 kHz. Mixer определяет
+   полную частоту по `frames`, `bands` и `framesPerBand`; иначе cursor двигался
+   в три раза быстрее.
 
 2. **Wall-clock позиция (`CACurrentMediaTime`)**
    Callbacks не идеально равномерны → skip/repeat кусков.
