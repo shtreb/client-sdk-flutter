@@ -143,7 +143,7 @@ class Native {
     }
   }
 
-  /// iOS-only: attach mixer to the local audio track capture/render graph.
+  /// Attach mixer to the local audio track capture/render graph.
   @internal
   static Future<bool> startAudioMixer(String trackId) async {
     try {
@@ -158,7 +158,7 @@ class Native {
     }
   }
 
-  /// iOS-only: play a local audio file mixed into the LiveKit audio graph.
+  /// Play a local audio file mixed into the LiveKit audio graph.
   /// Returns the playId on success.
   @internal
   static Future<String?> playMixedAudio(
@@ -188,7 +188,7 @@ class Native {
     }
   }
 
-  /// iOS-only: stop one or all mixed playbooks.
+  /// Stop one or all mixed playbooks.
   @internal
   static Future<void> stopMixedAudio({String? playId}) async {
     try {
@@ -201,7 +201,7 @@ class Native {
     }
   }
 
-  /// iOS-only: update volume of an active mixed playback.
+  /// Update volume of an active mixed playback.
   @internal
   static Future<void> setMixedAudioVolume(String playId, double volume) async {
     try {
@@ -217,7 +217,7 @@ class Native {
     }
   }
 
-  /// iOS-only: detach mixer from the WebRTC audio graph.
+  /// Detach mixer from the WebRTC audio graph.
   @internal
   static Future<void> stopAudioMixer() async {
     try {

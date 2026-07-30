@@ -1,160 +1,123 @@
-# MixAudio (iOS) — handoff
+# MixAudio native handoff
 
-## Проблема
+## Problem
 
-Во время LiveKit-звонка `AVAudioSession` в режимах `voiceChat` / `videoChat` приглушает (duck) сторонние плееры (`audioplayers`, `AVAudioPlayer` и т.п.). Звуки вне LiveKit слышны тише локально и часто **не уходят** remote-участникам.
+During a LiveKit call, native voice-call audio modes can duck or isolate audio
+played through a separate player. The result is that local sounds may be quiet
+for the user and may not be sent to remote participants.
 
-## Решение
+## Solution
 
-Не играть файл отдельным плеером, а **микшировать PCM файла в WebRTC audio graph** через `ExternalAudioProcessingDelegate` из `flutter_webrtc`.
+Use `MixAudio` to decode a local audio file and mix its PCM samples into the
+LiveKit WebRTC audio graph instead of playing it through a separate player.
 
-Платформа: **только iOS**. Android / macOS / web — нет реализации.
+Supported platforms:
 
----
+- iOS
+- Android
 
-## Архитектура
+Unsupported platforms return `null` from `MixAudio.start`.
 
-```
+## Architecture
+
+```text
 Flutter MixAudio
-    → MethodChannel "livekit_client"
-        → LiveKitPlugin (iOS)
-            → AudioMixerController
-                ├─ AudioMixerEngine          // shared playbooks + decode/mix
-                ├─ AudioMixerTap(.capture)   // → LocalAudioTrack.addProcessing
-                └─ AudioMixerTap(.render)    // → renderPreProcessingAdapter
+    -> MethodChannel "livekit_client"
+        -> LiveKitPlugin
+            -> AudioMixerController
+                -> AudioMixerEngine
+                -> capture tap
+                -> render tap
 ```
 
-| Путь | Adapter | Когда микшируется |
-|------|---------|-------------------|
-| **Capture** | `capturePostProcessingAdapter` | `sendToRemote: true` |
-| **Render** | `renderPreProcessingAdapter` | `playLocally: true` |
+| Path | iOS adapter | Android adapter | Plays when |
+| --- | --- | --- | --- |
+| Capture | `LocalAudioTrack.addProcessing` | `AudioProcessingController.capturePostProcessing` | `sendToRemote: true` |
+| Render | `renderPreProcessingAdapter` | `AudioProcessingController.renderPreProcessing` | `playLocally: true` |
 
-Два отдельных tap'а (не один processor на оба adapter), иначе нельзя независимо фильтровать local/remote. Позиция playback общая и идёт по `CACurrentMediaTime`.
+On iOS, the capture tap is attached to the selected `LocalAudioTrack`. On
+Android, `flutter_webrtc` exposes audio processing through a single global
+`AudioProcessingController`, so `trackId` validates that a local audio track
+exists and anchors the mixer lifecycle, but the processing tap itself is global
+to the WebRTC audio pipeline. Apps using multiple simultaneous local audio
+tracks should treat Android mixing as pipeline-scoped, not strictly track-scoped.
 
-Post-processing идёт **после** AEC/NS/AGC.
-
----
-
-## Ключевые файлы
-
-| Файл | Роль |
-|------|------|
-| `shared_swift/AudioMixer.swift` | Engine + taps + controller |
-| `shared_swift/LiveKitPlugin.swift` | MethodChannel handlers (`#if os(iOS)`) |
-| `shared_swift/LocalAudioTrack.swift` | `add/remove(processing:)` wrappers |
-| `ios/Classes/AudioMixer.swift` | symlink → `shared_swift/` |
-| `lib/src/track/audio_mixer.dart` | публичный Dart API `MixAudio` |
-| `lib/src/support/native.dart` | `invokeMethod` wrappers |
-| `lib/livekit_client.dart` | export |
-| `docs/mix_audio_ios.md` | этот документ |
-
----
-
-## MethodChannel API (iOS only)
+## MethodChannel API
 
 Channel: `livekit_client`
 
 | Method | Args | Result |
-|--------|------|--------|
+| --- | --- | --- |
 | `startAudioMixer` | `trackId` | `bool` |
-| `playMixedAudio` | `filePath`, `playId`, `volume`, `loop`, **`playLocally`**, **`sendToRemote`** | `playId` |
+| `playMixedAudio` | `filePath`, `playId`, `volume`, `loop`, `playLocally`, `sendToRemote` | `playId` |
 | `stopMixedAudio` | `playId?` | `true` |
 | `setMixedAudioVolume` | `playId`, `volume` | `true` |
 | `stopAudioMixer` | `{}` | `true` |
 
 Defaults: `playLocally: true`, `sendToRemote: true`.
 
----
-
 ## Dart API
 
 ```dart
 final mixer = await MixAudio.start(localAudioTrack);
 
-// Только себе (remote НЕ слышит):
 await mixer?.play(
   path,
   playLocally: true,
   sendToRemote: false,
 );
 
-// Только remote (локально не играть через render):
 await mixer?.play(
   path,
   playLocally: false,
   sendToRemote: true,
 );
 
-// И себе, и remote (default):
 await mixer?.play(path);
-
 await mixer?.dispose();
 ```
 
----
+## Audio Quality
 
-## Качество звука / анти-искажения
+- Files are decoded at their native output rate and resampled to the WebRTC
+  callback rate with linear interpolation.
+- Each tap has an independent frame cursor (`captureReadPos` and
+  `renderReadPos`) so local playback and remote send can be enabled separately.
+- Files are normalized by active RMS with peak headroom, then overload is
+  compressed with a soft knee instead of hard clipping.
+- A short fade is applied to file edges to avoid clicks, especially with loops.
 
-Типичные причины «сильного» искажения и что сделано:
+## Android Notes
 
-1. **Sample rate split-band буфера**
-   `audioProcessingInitialize` может сообщить rate одной полосы (например,
-   16 kHz), хотя `rawBuffer` содержит full-band кадры 48 kHz. Mixer определяет
-   полную частоту по `frames`, `bands` и `framesPerBand`; иначе cursor двигался
-   в три раза быстрее.
+- Decode runs on a background single-thread executor so `playMixedAudio` does
+  not block the Flutter platform thread.
+- Android decoding uses `MediaExtractor` and `MediaCodec`; supported formats are
+  device/OS dependent. Commonly supported formats include WAV, MP3, AAC/M4A,
+  and many container/codec combinations supported by Android media codecs.
+- Decoded audio is currently loaded into memory before playback. This matches
+  the current iOS implementation and is best suited for short sounds or bounded
+  music clips. Very long tracks can use significant memory; streaming decode
+  would require a larger native playback pipeline.
+- `flutter_webrtc` currently provides 16-bit PCM buffers to
+  `AudioProcessingAdapter`. The Android mixer validates the buffer shape and
+  skips unexpected layouts instead of writing into a buffer it does not
+  understand.
 
-2. **Wall-clock позиция (`CACurrentMediaTime`)**
-   Callbacks не идеально равномерны → skip/repeat кусков.
-   → у каждого tap свой **frame cursor** (`captureReadPos` / `renderReadPos`), двигается на `frames * (fileRate/deviceRate)` за callback.
+## Lifecycle
 
-3. **Неправильный soft-clip и перегруз при суммировании**
-   Старый soft-clip менял даже тихий сигнал, а hard clamp хрипел на каждом
-   перегруженном пике. Теперь файл автоматически нормализуется по active RMS
-   примерно к `-20 dBFS`, его пики удерживаются ниже `-6 dBFS`, а зона
-   перегруза сжимается плавно. Параметр `volume` работает как относительная
-   поправка поверх автоматической нормализации.
+1. Call `MixAudio.start` after the microphone track is created or published.
+2. If the microphone track is restarted, call `dispose`, then `start` again with
+   the new track.
+3. `playLocally: false` and `sendToRemote: false` is rejected.
+4. `stop(playId)` stops one playback; `stop()` stops all active playbacks.
+5. `dispose()` detaches capture/render taps and clears active playbacks.
 
-4. **MP3 decode** одним `read` иногда неполный.
-   → chunked read через `AVAudioFile` до EOF.
+## Quick Check
 
-5. Файл декодируется в **native rate** (для тестового CDN mp3 это 48 kHz stereo → mono FloatS16), ресемпл в device rate через linear interpolation.
-
-6. На первых и последних 5 ms файла применяется короткий fade, чтобы начало,
-   окончание и loop не создавали щелчок из-за разрыва waveform.
-
-Формат WebRTC `RTCAudioBuffer.rawBuffer`: **FloatS16**, не `[-1, 1]`.
-
-В Xcode console при старте/play смотри логи:
-`[LiveKit] AudioMixer: render initialize rate=...`
-`[LiveKit] AudioMixer: loaded N samples @ RATE Hz, peak=...`
-
----
-
-## Поддерживаемые аудиоформаты
-
-Декод через **`AVAudioFile`** (AVFoundation).
-
-Обычно OK: **WAV**, **CAF**, **AIFF**, **MP3**, **M4A/AAC**, **ALAC**.
-
-Нужен локальный filesystem path; asset → сначала в temp. Файл целиком в память. Opus/Ogg/FLAC могут не открыться.
-
-Рекомендация для SFX: короткий **WAV** или **M4A**.
-
----
-
-## Lifecycle / pitfalls
-
-1. `MixAudio.start` **после** publish/create mic (`localTracks[trackId]` должен существовать).
-2. Restart mic → `dispose` + `start` на новый track.
-3. `playLocally: false` + `sendToRemote: false` → ошибка / `null`.
-4. Render tap слышен, когда активен WebRTC audio unit (типичный звонок).
-5. Не путать с отдельным published audio track — это mix в mic/render graph.
-
----
-
-## Быстрая проверка
-
-1. Mic published на iOS.
-2. `play(..., playLocally: true, sendToRemote: false)` → слышно локально, remote **не** слышит.
-3. `play(..., playLocally: false, sendToRemote: true)` → remote слышит, локально через render нет.
-4. Звук без сильного chipmunk/хрипа; pitch близок к оригиналу.
+1. Publish a mic track.
+2. `play(..., playLocally: true, sendToRemote: false)` should be heard locally
+   only.
+3. `play(..., playLocally: false, sendToRemote: true)` should be heard by remote
+   participants only.
+4. Pitch should stay close to the original file, without obvious clicks or
+   clipping.

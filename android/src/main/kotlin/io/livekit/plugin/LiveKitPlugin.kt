@@ -28,12 +28,19 @@ import io.flutter.plugin.common.MethodChannel.Result
 import com.cloudwebrtc.webrtc.FlutterWebRTCPlugin
 import com.cloudwebrtc.webrtc.audio.LocalAudioTrack
 import io.flutter.plugin.common.BinaryMessenger
+import android.os.Handler
+import android.os.Looper
 import org.webrtc.AudioTrack
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /** LiveKitPlugin */
 class LiveKitPlugin: FlutterPlugin, MethodCallHandler {
   private var processors = mutableMapOf<String, Visualizer>()
   private var flutterWebRTCPlugin = FlutterWebRTCPlugin.sharedSingleton
+  private var audioMixer: AudioMixerController? = null
+  private var mixerExecutor: ExecutorService? = null
+  private val mainHandler = Handler(Looper.getMainLooper())
   private var binaryMessenger: BinaryMessenger? = null
   /// The MethodChannel that will the communication between Flutter and native Android
   ///
@@ -42,9 +49,12 @@ class LiveKitPlugin: FlutterPlugin, MethodCallHandler {
   private lateinit var channel : MethodChannel
 
   override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+    audioMixer?.detach()
+    audioMixer = null
     channel = MethodChannel(flutterPluginBinding.binaryMessenger, "livekit_client")
     channel.setMethodCallHandler(this)
     binaryMessenger = flutterPluginBinding.binaryMessenger
+    mixerExecutor = Executors.newSingleThreadExecutor()
   }
 
   @SuppressLint("SuspiciousIndentation")
@@ -96,6 +106,113 @@ class LiveKitPlugin: FlutterPlugin, MethodCallHandler {
     result.success(null)
   }
 
+  private fun handleStartAudioMixer(@NonNull call: MethodCall, @NonNull result: Result) {
+    val trackId = call.argument<String>("trackId")
+    if (trackId == null) {
+      result.error("INVALID_ARGUMENT", "trackId is required", null)
+      return
+    }
+
+    val track = flutterWebRTCPlugin.getLocalTrack(trackId)
+    if (track !is LocalAudioTrack) {
+      result.error("INVALID_ARGUMENT", "local audio track not found", null)
+      return
+    }
+
+    if (audioMixer?.isAttached == true) {
+      result.error("mixer", "Audio mixer is already started. Call stopAudioMixer first.", null)
+      return
+    }
+
+    val mixer = audioMixer ?: AudioMixerController()
+    mixer.attach(flutterWebRTCPlugin.getAudioProcessingController(), trackId)
+    audioMixer = mixer
+    result.success(true)
+  }
+
+  private fun handlePlayMixedAudio(@NonNull call: MethodCall, @NonNull result: Result) {
+    val mixer = audioMixer
+    if (mixer?.isAttached != true) {
+      result.error("mixer", "Audio mixer is not started. Call startAudioMixer first.", null)
+      return
+    }
+
+    val filePath = call.argument<String>("filePath")
+    val playId = call.argument<String>("playId")
+    if (filePath == null || playId == null) {
+      result.error("INVALID_ARGUMENT", "filePath and playId are required", null)
+      return
+    }
+
+    val volume = (call.argument<Any>("volume") as? Number)?.toFloat() ?: 1.0f
+    val loop = call.argument<Boolean>("loop") ?: false
+    val playLocally = call.argument<Boolean>("playLocally") ?: true
+    val sendToRemote = call.argument<Boolean>("sendToRemote") ?: true
+
+    val executor = mixerExecutor
+    if (executor == null || executor.isShutdown) {
+      result.error("mixer", "Audio mixer executor is not available", null)
+      return
+    }
+
+    executor.execute {
+      val playResult = mixer.play(
+        filePath = filePath,
+        playId = playId,
+        volume = volume,
+        loop = loop,
+        playLocally = playLocally,
+        sendToRemote = sendToRemote
+      )
+
+      mainHandler.post {
+        when (playResult) {
+          is AudioMixerPlayResult.Success -> result.success(playResult.playId)
+          is AudioMixerPlayResult.Failure -> result.error(
+            playResult.code,
+            playResult.message,
+            playResult.details
+          )
+        }
+      }
+    }
+  }
+
+  private fun handleStopMixedAudio(@NonNull call: MethodCall, @NonNull result: Result) {
+    val mixer = audioMixer
+    if (mixer == null) {
+      result.success(true)
+      return
+    }
+
+    mixer.stop(call.argument<String>("playId"))
+    result.success(true)
+  }
+
+  private fun handleSetMixedAudioVolume(@NonNull call: MethodCall, @NonNull result: Result) {
+    val mixer = audioMixer
+    if (mixer?.isAttached != true) {
+      result.error("mixer", "Audio mixer is not started", null)
+      return
+    }
+
+    val playId = call.argument<String>("playId")
+    if (playId == null) {
+      result.error("INVALID_ARGUMENT", "playId is required", null)
+      return
+    }
+
+    val volume = (call.argument<Any>("volume") as? Number)?.toFloat() ?: 1.0f
+    mixer.setVolume(playId, volume)
+    result.success(true)
+  }
+
+  private fun handleStopAudioMixer(@NonNull result: Result) {
+    audioMixer?.detach()
+    audioMixer = null
+    result.success(true)
+  }
+
   override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
     if(call.method == "startVisualizer") {
       handleStartVisualizer(call, result)
@@ -103,12 +220,31 @@ class LiveKitPlugin: FlutterPlugin, MethodCallHandler {
     } else if(call.method == "stopVisualizer") {
       handleStopVisualizer(call, result)
       return
+    } else if(call.method == "startAudioMixer") {
+      handleStartAudioMixer(call, result)
+      return
+    } else if(call.method == "playMixedAudio") {
+      handlePlayMixedAudio(call, result)
+      return
+    } else if(call.method == "stopMixedAudio") {
+      handleStopMixedAudio(call, result)
+      return
+    } else if(call.method == "setMixedAudioVolume") {
+      handleSetMixedAudioVolume(call, result)
+      return
+    } else if(call.method == "stopAudioMixer") {
+      handleStopAudioMixer(result)
+      return
     }
     // no-op for now
     result.notImplemented()
   }
 
   override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+    audioMixer?.detach()
+    audioMixer = null
+    mixerExecutor?.shutdownNow()
+    mixerExecutor = null
     channel.setMethodCallHandler(null)
   }
 }

@@ -19,10 +19,15 @@ import '../support/native.dart';
 import '../support/platform.dart';
 import 'local/audio.dart';
 
-/// iOS-only helper that mixes audio files into the LiveKit WebRTC audio graph.
+/// Native helper that mixes audio files into the LiveKit WebRTC audio graph.
 ///
 /// Use this instead of a separate audio player while in a LiveKit call: session
 /// modes like `voiceChat` / `videoChat` duck third-party playback.
+///
+/// On Android, `flutter_webrtc` exposes a single global audio processing
+/// controller. [track] is still required to validate that a local audio track
+/// exists, but mixing is scoped to the WebRTC audio pipeline rather than to one
+/// individual local track when multiple local audio tracks are active.
 ///
 /// Example (local only — other participants do not hear it):
 /// ```dart
@@ -47,7 +52,7 @@ class MixAudio {
   /// Call after the microphone track is created / published.
   static Future<MixAudio?> start(LocalAudioTrack track) async {
     if (!isSupported) {
-      logger.warning('MixAudio is only supported on iOS');
+      logger.warning('MixAudio is only supported on iOS and Android');
       return null;
     }
 
@@ -65,7 +70,8 @@ class MixAudio {
   }
 
   /// Whether the current platform supports [MixAudio].
-  static bool get isSupported => lkPlatformIs(PlatformType.iOS);
+  static bool get isSupported =>
+      lkPlatformIs(PlatformType.iOS) || lkPlatformIs(PlatformType.android);
 
   /// Plays an audio file from a local filesystem [filePath].
   ///
@@ -89,7 +95,8 @@ class MixAudio {
       return null;
     }
     if (!playLocally && !sendToRemote) {
-      logger.warning('MixAudio.play: playLocally and sendToRemote are both false');
+      logger.warning(
+          'MixAudio.play: playLocally and sendToRemote are both false');
       return null;
     }
     final id = playId ?? _uuid.v4();
