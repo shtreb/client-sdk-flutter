@@ -35,7 +35,7 @@ import kotlin.math.sqrt
 private const val TAG = "LiveKitAudioMixer"
 private const val PCM_LIMIT = 32767f
 
-private enum class MixerTapKind {
+internal enum class MixerTapKind {
     CAPTURE,
     RENDER
 }
